@@ -58,16 +58,16 @@ resource "aws_glue_catalog_database" "rds_mdm_catalog_db" {
 
 resource "aws_glue_connection" "rds_glue_connection" {
   connection_properties   = {
-    JDBC_CONNECTION_URL   = "jdbc:mysql://${aws_rds_cluster.aurora_serverless_v1.endpoint}:${aws_rds_cluster.aurora_serverless_v1.port}/${var.db_name}"
+    JDBC_CONNECTION_URL   = "jdbc:mysql://${aws_rds_cluster.aurora_serverless_v1.endpoint}:${aws_rds_cluster.aurora_serverless_v1.port}/${var.app2_db_name}"
     SECRET_ID             = aws_secretsmanager_secret.key_secret.name
   }
 
   name                    = "${var.app_shortcode}-mdm-rds-connection"
 
   physical_connection_requirements {
-    availability_zone      = data.aws_subnet.db_subnet[0].availability_zone
-    subnet_id              = data.aws_subnet.db_subnet[0].id
-    security_group_id_list = [ aws_security_group.db_sg.id ]
+    availability_zone      = data.aws_subnet.app2_subnet[0].availability_zone
+    subnet_id              = data.aws_subnet.app2_subnet[0].id
+    security_group_id_list = [ aws_security_group.app2_sg.id ]
   }
 }
 
@@ -80,6 +80,6 @@ resource "aws_glue_crawler" "rds_mdm_glue_crawler" {
 
   jdbc_target {
     connection_name       = aws_glue_connection.rds_glue_connection.name
-    path                  = "${var.db_name}/%"
+    path                  = "${var.app2_db_name}/%"
   }  
 }

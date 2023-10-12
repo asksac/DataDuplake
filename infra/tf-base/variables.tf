@@ -28,12 +28,17 @@ variable "app_shortcode" {
   description             = "Specify a short-code or pneumonic for this application or project, used for resource name prefix"
 }
 
-variable "db_vpc_id" {
+## App 1 Account Configuration
+
+
+## App 2 Account Configuration
+
+variable "app2_vpc_id" {
   type                    = string
   description             = "Specify a VPC ID where VPC bound resources will be created"
 }
 
-variable "db_subnet_ids" {
+variable "app2_subnet_ids" {
   type                    = list 
   description             = "Specify a list of Subnet IDs within above VPC for deployment"
 }
@@ -45,15 +50,38 @@ variable "az_count" {
 }
 */
 
-## RDS Aurora ##
+# RDS Aurora #
 
-variable "db_name" {
+variable "app2_db_name" {
   type                    = string
   description             = "RDS Aurora Database Name"
 }
 
-variable "db_master_user" {
+variable "app2_db_master_user" {
   type                    = string
   description             = "Aurora Database Master Username"
   #sensitive               = true
 }
+
+## Hub Account Configuration
+
+variable "hub_vpc_id" {
+  type                    = string
+  description             = "Specify a VPC ID where VPC bound resources will be created"
+}
+
+variable "hub_subnet_ids" {
+  type                    = list 
+  description             = "Specify a list of Subnet IDs within above VPC for deployment"
+}
+
+variable "hub_glue_assets_bucket" {
+  type                    = string 
+  description             = "S3 bucket name where Glue assets (libraries, job script, etc.) are stored"
+}
+
+variable "hub_gcp_project_id" {
+  type                    = string 
+  description             = "GCP Project Id that Hub connects to"
+}
+

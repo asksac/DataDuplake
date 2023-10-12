@@ -4,36 +4,10 @@
 
 resource "aws_db_subnet_group" "db_subnet_group" {
   name                    = "${var.app_shortcode}-aurora-subnet-group"
-  subnet_ids              = data.aws_subnet.db_subnet[*].id
+  subnet_ids              = data.aws_subnet.app2_subnet[*].id
 
   tags                    = {
       Name = "${var.app_name} Aurora DB Subnet Grp"
-  }
-}
-
-resource "aws_security_group" "db_sg" {
-  name                    = "${var.app_shortcode}_db_sg"
-  vpc_id                  = data.aws_vpc.db_vpc.id
-
-  ingress {
-    self                  = true
-    from_port             = 0
-    to_port               = 0
-    protocol              = "-1"
-  }
-
-  ingress {
-    cidr_blocks           = [ data.aws_vpc.db_vpc.cidr_block ]
-    from_port             = 0
-    to_port               = 0
-    protocol              = "-1"
-  }
-
-  egress {
-    from_port             = 0
-    to_port               = 0
-    protocol              = "-1"
-    cidr_blocks           = [ "0.0.0.0/0" ]
   }
 }
 
@@ -42,8 +16,8 @@ resource "aws_rds_cluster" "aurora_serverless_v1" {
   engine                  = "aurora-mysql" # uses latest supported mysql version
   engine_mode             = "serverless"
 
-  database_name           = var.db_name
-  master_username         = var.db_master_user
+  database_name           = var.app2_db_name
+  master_username         = var.app2_db_master_user
   master_password         = random_password.rds_master_password.result # var.db_master_pass
   #manage_master_user_password = true # Aurora Serverless v1 does not support this
   # output secrets arn = aws_rds_cluster.aurora_serverless_v1.master_user_secret.secret_arn
@@ -64,7 +38,7 @@ resource "aws_rds_cluster" "aurora_serverless_v1" {
 
   db_subnet_group_name    = aws_db_subnet_group.db_subnet_group.name
   port                    = 3306
-  vpc_security_group_ids  = [ aws_security_group.db_sg.id ]  
+  vpc_security_group_ids  = [ aws_security_group.app2_sg.id ]  
 
   backup_retention_period = 5
   preferred_backup_window = "07:00-09:00"
@@ -82,8 +56,8 @@ resource "aws_rds_cluster" "aurora_serverless_v2" {
   engine                  = "aurora-mysql" # uses latest supported mysql version
   engine_mode             = "provisioned"
 
-  database_name           = var.db_name
-  master_username         = var.db_master_user
+  database_name           = var.app2_db_name
+  master_username         = var.app2_db_master_user
   master_password         = random_password.new_random_password.result # var.db_master_pass
 
   serverlessv2_scaling_configuration {
@@ -99,7 +73,7 @@ resource "aws_rds_cluster" "aurora_serverless_v2" {
 
   db_subnet_group_name    = aws_db_subnet_group.db_subnet_group.name
   port                    = 3306
-  vpc_security_group_ids  = [ aws_security_group.db_sg.id ]  
+  vpc_security_group_ids  = [ aws_security_group.app2_sg.id ]  
 
   backup_retention_period = 5
   preferred_backup_window = "07:00-09:00"
