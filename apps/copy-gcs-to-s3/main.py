@@ -190,7 +190,6 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
     etag = s3_object_attr.get('ETag'),
     checksum = s3_object_attr.get('Checksum')
   )
-
   return response
 
 
