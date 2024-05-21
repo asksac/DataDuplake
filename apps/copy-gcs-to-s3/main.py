@@ -23,7 +23,7 @@ import crc32c
 
 # define global variables
 DEFAULT_CHUNK_SIZE = 1024 * 1024 * 64 # 64 MB
-DEFAULT_MAX_WORKERS = 5
+DEFAULT_MAX_WORKERS = 2
 
 s3_client = None
 gcs_client = None
@@ -112,7 +112,7 @@ def _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum: bool) -> di
 
 
 # copy a gcs object to s3 using mpu
-def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False): 
+def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False) -> dict: 
   gcs_bucket_name, gcs_object_name = _split_uri(source_object_uri)
   s3_bucket_name, s3_object_name = _split_uri(target_object_uri)
 
@@ -136,6 +136,7 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
     # initiatize multi-part copy
     total_parts = (gcs_object_size // chunk_size) + 1 
     mpu_parts = [None] * total_parts
+    logging.info('Starting multi-part object copy using %s parts, and checksum validation set to %s', total_parts, checksum)
 
     if checksum: 
       mpu = s3_client.create_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name, ChecksumAlgorithm='CRC32C')
@@ -146,7 +147,7 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
 
     if (max_workers <= 1):
       # perform a single threaded copy
-      logging.info('Starting single threaded multi-part object copy because max-workers is less than or equal to 1')
+      logging.info('Using single threaded multi-part object copy because max-workers is less than or equal to 1')
       for part_index in range(total_parts):
         start_byte = part_index * chunk_size
         end_byte = min((part_index + 1) * chunk_size, gcs_object_size) - 1 # end byte index is inclusive, so we minus 1
@@ -156,7 +157,7 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
         mpu_parts[part_index] = copy_part_response
     else: 
       # perform a multi-threaded copy
-      logging.info('Starting multi-threaded multi-part object copy with max-workers equal to %s', max_workers)
+      logging.info('Using multi-threaded multi-part object copy with max-workers equal to %s', max_workers)
       futures = []
       with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
         for part_index in range(total_parts):
@@ -187,9 +188,11 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
     bucket_name = s3_bucket_name,
     object_name = s3_object_name,
     object_size = s3_object_size, 
-    etag = s3_object_attr.get('ETag'),
-    checksum = s3_object_attr.get('Checksum')
+    chunk_size = chunk_size,
+    max_workers = max_workers,
+    etag = s3_object_attr.get('ETag')
   )
+  if checksum: response['checksum_crc32c'] = s3_object_attr.get('Checksum').get('ChecksumCRC32C') if isinstance(s3_object_attr.get('Checksum'), dict) else None
   return response
 
 
@@ -212,7 +215,7 @@ def lambda_handler(event, context):
 
   logging.info('Lambda called with event payload: %s', event) 
 
-  if not source_object_uri and not target_object_uri: 
+  if not source_object_uri or not target_object_uri: 
     err_msg = 'Request payload must include `source_object_uri` and `target_object_uri` attributes'
     logging.error(err_msg)
 
@@ -226,8 +229,10 @@ def lambda_handler(event, context):
     )
   else: 
     copy_response = copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size, max_workers, checksum)
-    end_time = time.time()
-    logging.info('Total execution time: %s ms', end_time - start_time)
+    end_time = time.time() # capture end time
+    execution_time = end_time - start_time
+    copy_response['execution_time'] = execution_time
+    logging.info('Total execution time: %s seconds', execution_time)
     return dict(
       statusCode = 200,
       headers = { 'Content-Type': 'application/json' }, 
