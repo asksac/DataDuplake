@@ -48,7 +48,10 @@ def _initializer():
 
   if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'): 
     # if GOOGLE_APPLICATION_CREDENTIALS is set, use the default gcp client
-    gcs_client = storage.Client()
+    #gcs_client = storage.Client()
+    key_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
+    credentials = service_account.Credentials.from_service_account_file(key_path)
+    gcs_client = storage.Client(credentials=credentials, project=credentials.project_id)
   else: 
     # if not, lets fetch a service account credentials via aws secrets manager
     # get value of 'GOOGLE_CREDENTIALS_SECRETS_MGR_ID' environment variable 
@@ -126,11 +129,11 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
   gcs_object_size = gcs_object.size
   logging.info('GCS source object size and etag: %s, %s', gcs_object_size, gcs_object.etag)
 
-  # s3 mpu requires parts to be atleast 5mb, so if gcs object size is less than 5mb, 
+  # s3 mpu requires parts to be atleast 5Mb, so if gcs object size is less than 5Mb, 
   # or less than chunk size, we direct copy the object
   if gcs_object_size < 5242880 or gcs_object_size <= chunk_size: 
     # initiate direct file copy
-    logging.info('Starting full object copy because GCS object size is either less than 5mb or less than chunk-size')
+    logging.info('Starting full object copy because GCS object size is either less than 5Mb or less than chunk-size')
     _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum)
   else: 
     # initiatize multi-part copy
