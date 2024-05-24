@@ -1,4 +1,5 @@
 import os, sys, time
+from datetime import datetime
 import base64, logging, json
 import argparse
 from urllib.parse import urlparse
@@ -220,6 +221,10 @@ def _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum: bool) -> di
 def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False) -> dict: 
   start_time = time.time() # capture start time
 
+  # use naive object to get local time based on system timezone (use TZ environment variable to set timezone)
+  now = datetime.now() 
+  source_object_uri = source_object_uri.format(now)
+  target_object_uri = target_object_uri.format(now)
   gcs_bucket_name, gcs_object_name = _split_uri(source_object_uri)
   s3_bucket_name, s3_object_name = _split_uri(target_object_uri)
 
