@@ -15,23 +15,91 @@ import boto3
 from google.cloud import storage
 from google.oauth2 import service_account
 
+import jsonschema
 import crc32c
-
-# gcp credentials must be stored in an aws secrets manager 
-# secret value must be a valid json object with the following attributes:
-#   - credentials: base64 encoded string containing the gcp service account credentials
 
 # define global variables
 DEFAULT_CHUNK_SIZE = 1024 * 1024 * 64 # 64 MB
 DEFAULT_MAX_WORKERS = 2
+DEFAULT_CHECKSUM_ENABLED = False
+RETRY_DELAY = 2 # number of seconds to wait before retrying on read/write failure
+
+# define lambda payload schema
+LAMBDA_PAYLOAD_SCHEMA = {
+  "type": "object", 
+  "properties": {
+    "objects": {
+      "type": "array", 
+      "items": {
+        "type": "object",
+        "properties": {
+          "source_uri": {
+            "type": "string"
+          },
+          "target_uri": {
+            "type": "string"
+          },
+          "checksum": {
+            "type": "string"
+          }, 
+          "chunk_size": {
+            "type": "integer"
+          }, 
+          "max_workers": {
+            "type": "integer"
+          }          
+        },
+        "required": ["source_uri", "target_uri"]
+      }, 
+      "minItems" : 1
+    }, 
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "checksum": {
+          "type": "string"
+        }, 
+        "chunk_size": {
+          "type": "integer"
+        },
+        "max_workers": {
+          "type": "integer"
+        }
+      }
+    }
+  }, 
+  "required": ["objects"]
+}
+
+LAMBDA_PAYLOAD_EXAMPLE = '''{ 
+  "objects" : [ 
+    { 
+      "source_uri": "gs://xxxx", 
+      "target_uri": "s3://yyyy", 
+      "checksum": "yes", 
+      "max_workers": 1
+    }, 
+    { 
+      "source_uri": "gs://abcd", 
+      "target_uri": "s3://pqrs", 
+      "chunk_size": 102400
+    } 
+  ], 
+  "defaults": { 
+    "checksum": "false",
+    "chunk_size": 1024, 
+    "max_workers": 2 
+  } 
+}'''
 
 s3_client = None
 gcs_client = None
+lambda_schema_validator = None
 
-# configures logging and sets global variable values
+# must be called once at startup, configures logging and sets global variables
 # we use global variables carefully and in order to improve performance
 def _initializer(): 
-  global s3_client, gcs_client
+  global s3_client, gcs_client, lambda_schema_validator
 
   # get the log level from environment variable
   log_level = os.environ.get('LOG_LEVEL', 'INFO')
@@ -47,17 +115,18 @@ def _initializer():
   s3_client = boto3.client('s3')
 
   if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'): 
-    # if GOOGLE_APPLICATION_CREDENTIALS is set, use the default gcp client
-    #gcs_client = storage.Client()
+    # if GOOGLE_APPLICATION_CREDENTIALS variable is set, use that to create gcp client
     key_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
     credentials = service_account.Credentials.from_service_account_file(key_path)
     gcs_client = storage.Client(credentials=credentials, project=credentials.project_id)
   else: 
     # if not, lets fetch a service account credentials via aws secrets manager
     # get value of 'GOOGLE_CREDENTIALS_SECRETS_MGR_ID' environment variable 
+    # gcp credentials must be stored in aws secrets manager as a json object with attribute:
+    #   - credentials: base64 encoded string containing the gcp service account credentials
     secrets_mgr_id = os.environ.get('GOOGLE_CREDENTIALS_SECRETS_MGR_ID')
     if (not secrets_mgr_id):
-      logging.error('No default GCP credentials found, and no credentials Secrets Manager secret id defined. This Lambda function cannot create a GCP client, and therefore cannot continue. Goodbye!')
+      logging.error('No GCP credentials found. This Lambda function cannot create a GCP client, and therefore cannot continue. Goodbye!')
       sys.exit(1)
     else: 
       logging.info('Fetching GCP credentials from AWS Secrets Manager (Secret Id: %s)...', secrets_mgr_id)
@@ -65,33 +134,66 @@ def _initializer():
       logging.info('Read GCP credentials json (size %s bytes)', len(credentials_json))
       storage_credentials = service_account.Credentials.from_service_account_info(json.loads(credentials_json))
       gcs_client = storage.Client(credentials=storage_credentials)
+
+  lambda_schema_validator = jsonschema.Draft202012Validator(LAMBDA_PAYLOAD_SCHEMA) 
   logging.info('Initialization complete with AWS and GCS clients created')
 
+# fetch and base64 decode credentials from aws secrets manager
+def get_credentials_from_secrets_mgr(secret_id: str) -> str:
+  client = boto3.client('secretsmanager')
+  response = client.get_secret_value(SecretId=secret_id)
+  credentials_base64 = json.loads(response['SecretString'])['credentials']
+  return base64.b64decode(credentials_base64).decode('utf-8')
 
 # splits an aws s3 or gcp storage object uri into bucket name and object name
-def _split_uri(uri):
+def _split_uri(uri: str) -> tuple:
   parsed_uri = urlparse(uri)
   bucket_name = parsed_uri.netloc
   object_name = parsed_uri.path.lstrip('/')
   return bucket_name, object_name
 
-
 # copy a chunk of a gcs object to s3 using multi-part upload
+# if checksum is true, we will use ultrafast crc32c checksum algorithm
 def _copy_part(gcs_object, s3_bucket_name, s3_object_name, part_num: int, total_parts: int, mpu_id: int, start_byte: int, end_byte: int, checksum: bool) -> dict:
-  logging.info('Reading GCS object chunk #%s of %s: start byte: %s | end byte: %s', part_num, total_parts, start_byte, end_byte)
-  gcs_chunk = gcs_object.download_as_bytes(start=start_byte, end=end_byte) 
-  logging.info('Read GCS object chunk of length: %s bytes', len(gcs_chunk))
+  logging.info('Reading GCS object chunk #%s of %s (start byte: %s; end byte: %s)', part_num, total_parts, start_byte, end_byte)
+  try: 
+    gcs_chunk = gcs_object.download_as_bytes(start=start_byte, end=end_byte) 
+  except Exception as e:
+    logging.error('Encountered an error reading GCS object chunk #%s: %s', part_num, e)
+    # let's retry reading gcs chunk one more time
+    logging.info('Retrying reading GCS object chunk #%s after a delay of %s seconds', part_num, RETRY_DELAY)
+    time.sleep(RETRY_DELAY)
+    gcs_chunk = gcs_object.download_as_bytes(start=start_byte, end=end_byte) 
 
+  # download successful if reached here
+  logging.info('Read GCS object chunk #%s of length: %s bytes', part_num, len(gcs_chunk))
+
+  upload_part_args = dict(Bucket=s3_bucket_name, Key=s3_object_name, Body=gcs_chunk, PartNumber=part_num, UploadId=mpu_id)
   if checksum: 
     crc_checksum = crc32c.crc32c(gcs_chunk) # returns an int
-    crc_checksum_b64 = base64.b64encode(crc_checksum.to_bytes(4, byteorder='big', signed=False)).decode('ascii') # convert int to 32 bit and then base64 encode
-    logging.info('GCS object chunk CRC32C checksum: int(%s) and base64(%s)', crc_checksum, crc_checksum_b64)
-    s3_response = s3_client.upload_part(Bucket=s3_bucket_name, Key=s3_object_name, Body=gcs_chunk, PartNumber=part_num, UploadId=mpu_id, ChecksumAlgorithm='CRC32C', ChecksumCRC32C=crc_checksum_b64)
-    logging.info('Wrote GCS object chunk to S3 part: %s', s3_response)
+    crc_checksum_b64 = base64.b64encode(crc_checksum.to_bytes(4, byteorder='big', signed=False)).decode('ascii') # convert int to 32 bits and then base64 encode
+    upload_part_args.update(dict(ChecksumAlgorithm='CRC32C', ChecksumCRC32C=crc_checksum_b64))
+    logging.info('Uploading GCS object chunk #%s to S3 with CRC32C checksum: int(%s) and base64(%s)', part_num, crc_checksum, crc_checksum_b64)
+  else: 
+    logging.info('Uploading GCS object chunk #%s to S3 without checksum', part_num)
+
+  try: 
+    s3_response = s3_client.upload_part(**upload_part_args)
+  except Exception as e:
+    logging.error('Encountered an error uploading GCS object chunk #%s to S3: %s', part_num, e)
+    # let's retry uploading chunk one more time
+    # ideally, we should retry only if error is recoverable, i.e. usually 5xx http code
+    # but we're being (very) lazy here and retrying after any error
+    logging.info('Retrying uploading GCS object chunk #%s to S3 after a delay of %s seconds', part_num, RETRY_DELAY)
+    time.sleep(RETRY_DELAY)
+    s3_response = s3_client.upload_part(**upload_part_args)
+
+  # upload successful if reached here
+  logging.info('Wrote GCS object chunk #%s to S3 part, which returned: %s', part_num, s3_response) 
+
+  if checksum:
     return {"ETag": s3_response["ETag"], "PartNumber": part_num, "ChecksumCRC32C": crc_checksum_b64}
   else: 
-    s3_response = s3_client.upload_part(Bucket=s3_bucket_name, Key=s3_object_name, Body=gcs_chunk, PartNumber=part_num, UploadId=mpu_id)
-    logging.info('Wrote GCS object chunk to S3 part: %s', s3_response)
     return {"ETag": s3_response["ETag"], "PartNumber": part_num}
 
 
@@ -116,16 +218,18 @@ def _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum: bool) -> di
 
 # copy a gcs object to s3 using mpu
 def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False) -> dict: 
+  start_time = time.time() # capture start time
+
   gcs_bucket_name, gcs_object_name = _split_uri(source_object_uri)
   s3_bucket_name, s3_object_name = _split_uri(target_object_uri)
 
   logging.info('GCS source bucket `%s` and object key `%s`', gcs_bucket_name, gcs_object_name)
   logging.info('S3 target bucket `%s` and object key `%s`', s3_bucket_name, s3_object_name)
 
+  # fetch gcs blob
   gcs_bucket = gcs_client.bucket(gcs_bucket_name)
   gcs_object = gcs_bucket.get_blob(gcs_object_name)
   gcs_object.reload() # required to read blob attributes like size
-
   gcs_object_size = gcs_object.size
   logging.info('GCS source object size and etag: %s, %s', gcs_object_size, gcs_object.etag)
 
@@ -133,10 +237,11 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
   # or less than chunk size, we direct copy the object
   if gcs_object_size < 5242880 or gcs_object_size <= chunk_size: 
     # initiate direct file copy
+    total_parts = 1
     logging.info('Starting full object copy because GCS object size is either less than 5Mb or less than chunk-size')
     _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum)
   else: 
-    # initiatize multi-part copy
+    # initiate multi-part copy
     total_parts = (gcs_object_size // chunk_size) + 1 
     mpu_parts = [None] * total_parts
     logging.info('Starting multi-part object copy using %s parts, and checksum validation set to %s', total_parts, checksum)
@@ -183,63 +288,86 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
   logging.info('S3 target object attributes: %s', s3_object_attr)
 
   if gcs_object_size != s3_object_size:
-    raise Exception('GCS and S3 object sizes do not match. GCS size: %s, S3 size: %s', gcs_object_size, s3_object_size)
+    logging.error('Original GCS object (%s bytes) and copied S3 object (%s bytes) sizes do not match', gcs_object_size, s3_object_size)
+    status = 'COPY_SUCCESS_SIZE_MISMATCHED'
   else: 
     logging.info('GCS and S3 object sizes match. GCS size: %s, S3 size: %s', gcs_object_size, s3_object_size)
 
+    status = 'COPY_SUCCESS_SIZE_MATCHED'
+
+  end_time = time.time() # capture end time
+  execution_time = end_time - start_time
+  logging.info('Object copy total execution time: %s seconds', execution_time)
+
   response = dict(
+    status = status,    
     bucket_name = s3_bucket_name,
     object_name = s3_object_name,
     object_size = s3_object_size, 
-    chunk_size = chunk_size,
-    max_workers = max_workers,
-    etag = s3_object_attr.get('ETag')
+    parts = total_parts,
+    etag = s3_object_attr.get('ETag'), 
+    execution_time = execution_time
   )
-  if checksum: response['checksum_crc32c'] = s3_object_attr.get('Checksum').get('ChecksumCRC32C') if isinstance(s3_object_attr.get('Checksum'), dict) else None
+  if checksum: 
+    response['checksum_crc32c'] = s3_object_attr.get('Checksum', {}).get('ChecksumCRC32C')
+
   return response
 
 
-def get_credentials_from_secrets_mgr(secret_id):
-  client = boto3.client('secretsmanager')
-  response = client.get_secret_value(SecretId=secret_id)
-  credentials_base64 = json.loads(response['SecretString'])['credentials']
-  return base64.b64decode(credentials_base64).decode('utf-8')
-
-
 def lambda_handler(event, context):
-  # capture start time
-  start_time = time.time()
+  # validate lambda payload using the defined json schema
+  if lambda_schema_validator.is_valid(event): 
+    # json payload conforms to schema
+    logging.info('Lambda invoked with a valid payload: %s', event) 
+    default_chunk_size = event.get('defaults', {}).get('chunk_size', DEFAULT_CHUNK_SIZE)
+    default_max_workers = event.get('defaults', {}).get('max_workers', DEFAULT_MAX_WORKERS)
+    default_checksum = event.get('defaults', {}).get('checksum', DEFAULT_CHECKSUM_ENABLED)
 
-  source_object_uri = event.get('source_object_uri')
-  target_object_uri = event.get('target_object_uri')
-  chunk_size = int(event.get('chunk_size', DEFAULT_CHUNK_SIZE))
-  max_workers = int(event.get('max_workers', DEFAULT_MAX_WORKERS))
-  checksum = event.get('checksum', False) in [True, 'True', 'true', 'Yes', 'yes', 'Y', 'y', '1'] 
+    copy_count = 0
+    copy_responses = []
+    for object_def in event.get('objects'): 
+      copy_count += 1
+      source_object_uri = object_def.get('source_uri')
+      target_object_uri = object_def.get('target_uri')
+      chunk_size = int(object_def.get('chunk_size', default_chunk_size))
+      max_workers = int(object_def.get('max_workers', default_max_workers))
+      checksum = object_def.get('checksum', default_checksum) in [True, 'True', 'true', 'Yes', 'yes', 'Y', 'y', '1'] 
 
-  logging.info('Lambda called with event payload: %s', event) 
+      try: 
+        logging.info('Copying object #%s: %s -> %s', copy_count, source_object_uri, target_object_uri)
+        copy_object_response = copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size, max_workers, checksum)
+        logging.info('Copying object #%s completed with response: %s', copy_count, copy_object_response)
+      except Exception as e:
+        logging.error('Error encountered copying object #%s: %s', copy_count, e)
+        copy_object_response = dict(
+          status = 'COPY_FAILED',
+          err_code = 500,
+          err_message = str(e)
+        )
+      copy_responses.append(copy_object_response)
 
-  if not source_object_uri or not target_object_uri: 
-    err_msg = 'Request payload must include `source_object_uri` and `target_object_uri` attributes'
-    logging.error(err_msg)
-
-    return dict(
-      statusCode = 500,
-      headers = { 'Content-Type': 'application/json' }, 
-      body = dict(
-        err_code = 500, 
-        err_message = err_msg
-      )
-    )
-  else: 
-    copy_response = copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size, max_workers, checksum)
-    end_time = time.time() # capture end time
-    execution_time = end_time - start_time
-    copy_response['execution_time'] = execution_time
-    logging.info('Total execution time: %s seconds', execution_time)
+    # return copy responses
     return dict(
       statusCode = 200,
       headers = { 'Content-Type': 'application/json' }, 
-      body = copy_response
+      body = { "results": copy_responses } 
+    )
+  else: 
+    # payload schema is not valid
+    logging.error('Lambda invoked with an invalid payload: %s', event)
+    logging.info('Example of a valid payload is: %s', LAMBDA_PAYLOAD_EXAMPLE)
+    payload_errors = [ err.message for err in lambda_schema_validator.iter_errors(event) ]
+    logging.error('Lambda payload errors: %s', payload_errors)
+    return dict(
+      statusCode = 400,
+      headers = { 'Content-Type': 'application/json' }, 
+      body = dict(
+        error = dict(
+          code = 400, 
+          message = 'Lambda payload invalid',
+          details = payload_errors
+        )
+      )
     )
 
 #-----
@@ -262,16 +390,19 @@ if __name__ == "__main__":
                           )
   cliparser.add_argument('--chunk-size', '-c',
                           required=False,
+                          type=int,
                           default=DEFAULT_CHUNK_SIZE,
                           help='chunk size in bytes (default: %s)' % DEFAULT_CHUNK_SIZE
                         )
   cliparser.add_argument('--max-workers', '-w',
                           required=False,
+                          type=int,
                           default=DEFAULT_MAX_WORKERS,
                           help='max number of concurrent workers (default: %s)' % DEFAULT_MAX_WORKERS
                         )
   cliparser.add_argument('--checksum', '-k',
                           required=False,
+                          type=str,
                           default=False,
                           help='whether checksum validation should be performed (valid values are True or False)'
                         )
@@ -279,5 +410,6 @@ if __name__ == "__main__":
   # extract cli option values and set program behavior
   args = cliparser.parse_args()
 
-  response = lambda_handler(dict(source_object_uri=args.source_uri, target_object_uri=args.target_uri, chunk_size=args.chunk_size, max_workers=args.max_workers, checksum=args.checksum), None)
+  lambda_payload = { "objects": [ dict(source_uri=args.source_uri, target_uri=args.target_uri, chunk_size=args.chunk_size, max_workers=args.max_workers, checksum=args.checksum) ] }
+  response = lambda_handler(lambda_payload, None)
   logging.info('Response from lambda_handler: %s', response)
