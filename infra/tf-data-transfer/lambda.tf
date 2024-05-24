@@ -7,6 +7,8 @@ locals {
       code_dir = "apps/copy-gcs-to-s3"
     },
   ]
+
+  python_version = "3.9"
 }
 
 resource "aws_cloudwatch_log_group" "copy_gcs_s3_log_group" {
@@ -20,7 +22,7 @@ resource "null_resource" "copy_gcs_s3_pip_install" {
   }
 
   provisioner "local-exec" {
-    command         = "python3 -m pip install --platform manylinux2014_x86_64 --only-binary=:all: -r ${path.module}/../../apps/copy-gcs-to-s3/requirements.txt -t ${path.module}/../../apps/copy-gcs-to-s3/lib"
+    command         = "python3 -m pip install --platform manylinux2014_x86_64 --only-binary=:all: --python-version ${local.python_version} -r ${path.module}/../../apps/copy-gcs-to-s3/requirements.txt -t ${path.module}/../../apps/copy-gcs-to-s3/lib"
   }
 }
 
@@ -37,17 +39,18 @@ resource "aws_lambda_function" "copy_gcs_s3_lambda" {
 
   handler           = "main.lambda_handler"
   role              = aws_iam_role.lambda_exec_role.arn
-  runtime           = "python3.11"
-  memory_size       = 1024 # 1 GB 
-  timeout           = 900 # 15 mins
+  runtime           = "python${local.python_version}"
+  memory_size       = 1769 # at 1769 memory we get 1 vCPU 
+  timeout           = 900 # 15 mins (max value)
 
   filename          = data.archive_file.copy_gcs_s3_archive.output_path
   source_code_hash  = data.archive_file.copy_gcs_s3_archive.output_base64sha256
 
   environment {
     variables       = {
-      LOG_LEVEL     = "INFO"
       GOOGLE_CREDENTIALS_SECRETS_MGR_ID = aws_secretsmanager_secret.gcp_secret.arn
+      LOG_LEVEL     = "INFO"
+      TZ            = "US/Eastern"
     }
   }
 
