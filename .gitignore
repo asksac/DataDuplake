@@ -46,3 +46,6 @@ override.tf.json
 
 # ignore files with nogit in the name
 **/*nogit*
+
+# ignore .venv
+.venv
