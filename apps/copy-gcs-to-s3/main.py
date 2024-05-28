@@ -11,6 +11,7 @@ if os.environ.get('LAMBDA_TASK_ROOT'):
 
 # aws sdk
 import boto3
+from botocore.config import Config
 
 # gcp storage and auth modules
 from google.cloud import storage
@@ -112,9 +113,16 @@ def _initializer():
 
   logging.info('Initializing Lambda runtime...')
 
-  # initialize aws s3 and gcp storage clients
-  s3_client = boto3.client('s3')
+  # create aws s3 client
+  config = Config(
+    retries = {
+      'max_attempts': 3, # change to set boto3 s3 max retries count
+      'mode': 'legacy' # legacy mode is default 
+    }
+  )
+  s3_client = boto3.client('s3', config=config)
 
+  # create gcp storage client
   if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'): 
     # if GOOGLE_APPLICATION_CREDENTIALS variable is set, use that to create gcp client
     key_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
@@ -179,15 +187,11 @@ def _copy_part(gcs_object, s3_bucket_name, s3_object_name, part_num: int, total_
     logging.info('Uploading GCS object chunk #%s to S3 without checksum', part_num)
 
   try: 
+    # boto3 has retry mechanism built-in for failures, including checksum failures 
     s3_response = s3_client.upload_part(**upload_part_args)
   except Exception as e:
     logging.error('Encountered an error uploading GCS object chunk #%s to S3: %s', part_num, e)
-    # let's retry uploading chunk one more time
-    # ideally, we should retry only if error is recoverable, i.e. usually 5xx http code
-    # but we're being (very) lazy here and retrying after any error
-    logging.info('Retrying uploading GCS object chunk #%s to S3 after a delay of %s seconds', part_num, RETRY_DELAY)
-    time.sleep(RETRY_DELAY)
-    s3_response = s3_client.upload_part(**upload_part_args)
+    raise # re-raise the exception so that the caller can handle it
 
   # upload successful if reached here
   logging.info('Wrote GCS object chunk #%s to S3 part, which returned: %s', part_num, s3_response) 
@@ -279,10 +283,16 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
           part_num = part_index + 1 # part numbers start at 1
           futures.append(executor.submit(_copy_part, gcs_object, s3_bucket_name, s3_object_name, part_num, total_parts, mpu_id, start_byte, end_byte, checksum))
         
-      for future in concurrent.futures.as_completed(futures):
-        copy_part_response = future.result()
-        mpu_parts[copy_part_response['PartNumber']-1] = copy_part_response
-        logging.info('copy_part response: %s', copy_part_response)
+        for future in concurrent.futures.as_completed(futures):
+          try: 
+            copy_part_response = future.result()
+          except Exception as e:
+            logging.error('One of the multi-part object copy threads returned an exception [%s]. Aborting copy operation now!', e)
+            # cancel all pending tasks and bubble up the exception
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise e
+          mpu_parts[copy_part_response['PartNumber']-1] = copy_part_response
+          logging.info('copy_part response: %s', copy_part_response)
 
     s3_response = s3_client.complete_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name, MultipartUpload={'Parts': mpu_parts}, UploadId=mpu_id)
     logging.info('S3 complete_multipart_upload response: %s', s3_response)
@@ -408,7 +418,7 @@ if __name__ == "__main__":
   cliparser.add_argument('--checksum', '-k',
                           required=False,
                           type=str,
-                          default=False,
+                          default='False',
                           help='whether checksum validation should be performed (valid values are True or False)'
                         )
 
