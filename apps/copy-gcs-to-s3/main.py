@@ -14,6 +14,7 @@ import boto3
 from botocore.config import Config
 
 # gcp storage and auth modules
+import google.auth
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -49,7 +50,10 @@ LAMBDA_PAYLOAD_SCHEMA = {
           }, 
           "max_workers": {
             "type": "integer"
-          }          
+          }, 
+          "kms_key_arn": {
+            "type": "string"
+          } 
         },
         "required": ["source_uri", "target_uri"]
       }, 
@@ -66,7 +70,10 @@ LAMBDA_PAYLOAD_SCHEMA = {
         },
         "max_workers": {
           "type": "integer"
-        }
+        }, 
+        "kms_key_arn": {
+          "type": "string"
+        } 
       }
     }
   }, 
@@ -90,7 +97,8 @@ LAMBDA_PAYLOAD_EXAMPLE = '''{
   "defaults": { 
     "checksum": "false",
     "chunk_size": 1024, 
-    "max_workers": 2 
+    "max_workers": 2, 
+    "kms_key_arn": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
   } 
 }'''
 
@@ -113,27 +121,28 @@ def _initializer():
 
   logging.info('Initializing Lambda runtime...')
 
-  # create aws s3 client
+  ## create aws s3 client
   config = Config(
     retries = {
       'max_attempts': 3, # change to set boto3 s3 max retries count
       'mode': 'legacy' # legacy mode is default 
-    }
+    }, 
+    proxies = {} # override any environment based proxy settings
   )
   s3_client = boto3.client('s3', config=config)
 
-  # create gcp storage client
-  if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'): 
-    # if GOOGLE_APPLICATION_CREDENTIALS variable is set, use that to create gcp client
-    key_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
-    credentials = service_account.Credentials.from_service_account_file(key_path)
-    gcs_client = storage.Client(credentials=credentials, project=credentials.project_id)
+  ## create gcp storage client
+  OAUTH_SCOPES = ['https://www.googleapis.com/auth/devstorage.read_write']
+  if os.environ.get('GCP_CREDENTIALS_FILE'): 
+    # if GCP_CREDENTIALS_FILE variable is set, use that to create gcp client
+    key_path = os.environ['GCP_CREDENTIALS_FILE']
+    gcp_credentials = service_account.Credentials.from_service_account_file(key_path, scopes=OAUTH_SCOPES)
   else: 
     # if not, lets fetch a service account credentials via aws secrets manager
-    # get value of 'GOOGLE_CREDENTIALS_SECRETS_MGR_ID' environment variable 
+    # get value of 'GCP_CREDENTIALS_SECRET_ID' environment variable 
     # gcp credentials must be stored in aws secrets manager as a json object with attribute:
     #   - credentials: base64 encoded string containing the gcp service account credentials
-    secrets_mgr_id = os.environ.get('GOOGLE_CREDENTIALS_SECRETS_MGR_ID')
+    secrets_mgr_id = os.environ.get('GCP_CREDENTIALS_SECRET_ID')
     if (not secrets_mgr_id):
       logging.error('No GCP credentials found. This Lambda function cannot create a GCP client, and therefore cannot continue. Goodbye!')
       sys.exit(1)
@@ -141,8 +150,15 @@ def _initializer():
       logging.info('Fetching GCP credentials from AWS Secrets Manager (Secret Id: %s)...', secrets_mgr_id)
       credentials_json = get_credentials_from_secrets_mgr(secrets_mgr_id) 
       logging.info('Read GCP credentials json (size %s bytes)', len(credentials_json))
-      storage_credentials = service_account.Credentials.from_service_account_info(json.loads(credentials_json))
-      gcs_client = storage.Client(credentials=storage_credentials)
+      gcp_credentials = service_account.Credentials.from_service_account_info(json.loads(credentials_json), scopes=OAUTH_SCOPES)
+
+  gcp_proxy = os.environ.get('GCP_PROXY') # proxy server used for GCP connections only
+  if gcp_proxy: 
+    auth_session = google.auth.transport.requests.AuthorizedSession(credentials=gcp_credentials)
+    auth_session.proxies.update({'https': gcp_proxy})
+    gcs_client = storage.Client(credentials=gcp_credentials, _http=auth_session)
+  else: 
+    gcs_client = storage.Client(credentials=gcp_credentials)
 
   lambda_schema_validator = jsonschema.Draft202012Validator(LAMBDA_PAYLOAD_SCHEMA) 
   logging.info('Initialization complete with AWS and GCS clients created')
@@ -158,8 +174,65 @@ def get_credentials_from_secrets_mgr(secret_id: str) -> str:
 def _split_uri(uri: str) -> tuple:
   parsed_uri = urlparse(uri)
   bucket_name = parsed_uri.netloc
-  object_name = parsed_uri.path.lstrip('/')
+  # object_name is also referred to as an object's key (especially in S3)
+  # in this program, we call it object_name to avoid any confusion with encryption key
+  object_name = parsed_uri.path.lstrip('/') 
   return bucket_name, object_name
+
+# copy gcs object to s3 using multi-part upload
+def _copy_mpu(gcs_object: str, s3_bucket_name: str, s3_object_name: str, gcs_object_size: int, total_parts: int, chunk_size: int, max_workers: int, checksum: bool, kms_key_arn: str): 
+  create_mpu_args = {
+    'Bucket': s3_bucket_name,
+    'Key': s3_object_name
+  }
+  if checksum: 
+    create_mpu_args.update({'ChecksumAlgorithm': 'CRC32C'})
+
+  if isinstance(kms_key_arn, str) and kms_key_arn.startswith('arn:aws'): 
+    create_mpu_args.update({'ServerSideEncryption': 'aws:kms', 'SSEKMSKeyId': kms_key_arn})
+  else: 
+    create_mpu_args.update({'ServerSideEncryption': 'AES256'})
+
+  # call s3 create_multipart_upload() with arguments
+  mpu = s3_client.create_multipart_upload(**create_mpu_args)
+
+  mpu_id = mpu['UploadId']
+  mpu_parts = [None] * total_parts
+
+  if (max_workers <= 1):
+    # perform a single threaded copy
+    logging.info('Using single threaded multi-part object copy because max-workers is less than or equal to 1')
+    for part_index in range(total_parts):
+      start_byte = part_index * chunk_size
+      end_byte = min((part_index + 1) * chunk_size, gcs_object_size) - 1 # end byte index is inclusive, so we minus 1
+      part_num = part_index + 1 # part numbers start at 1
+      copy_part_response = _copy_part(gcs_object, s3_bucket_name, s3_object_name, part_num, total_parts, mpu_id, start_byte, end_byte, checksum)
+      logging.info('copy_part response: %s', copy_part_response)
+      mpu_parts[part_index] = copy_part_response
+  else: 
+    # perform a multi-threaded copy
+    logging.info('Using multi-threaded multi-part object copy with max-workers equal to %s', max_workers)
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
+      for part_index in range(total_parts):
+        start_byte = part_index * chunk_size
+        end_byte = min((part_index + 1) * chunk_size, gcs_object_size) - 1 # end byte index is inclusive, so we minus 1
+        part_num = part_index + 1 # part numbers start at 1
+        futures.append(executor.submit(_copy_part, gcs_object, s3_bucket_name, s3_object_name, part_num, total_parts, mpu_id, start_byte, end_byte, checksum))
+      
+      for future in concurrent.futures.as_completed(futures):
+        try: 
+          copy_part_response = future.result()
+        except Exception as e:
+          logging.error('One of the multi-part object copy threads returned an exception [%s]. Aborting copy operation now!', e)
+          # cancel all pending tasks and bubble up the exception
+          executor.shutdown(wait=False, cancel_futures=True)
+          raise e
+        mpu_parts[copy_part_response['PartNumber']-1] = copy_part_response
+        logging.info('copy_part response: %s', copy_part_response)
+
+  s3_response = s3_client.complete_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name, MultipartUpload={'Parts': mpu_parts}, UploadId=mpu_id)
+  logging.info('S3 complete_multipart_upload response: %s', s3_response)
 
 # copy a chunk of a gcs object to s3 using multi-part upload
 # if checksum is true, we will use ultrafast crc32c checksum algorithm
@@ -203,26 +276,38 @@ def _copy_part(gcs_object, s3_bucket_name, s3_object_name, part_num: int, total_
 
 
 # copy full gcs object to s3
-def _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum: bool) -> dict:
+def _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum: bool, kms_key_arn: str) -> dict:
   logging.info('Reading full GCS object')
   gcs_data = gcs_object.download_as_bytes() 
   logging.info('Read GCS object of length: %s bytes', len(gcs_data))
 
+  put_object_args = {
+    'Bucket': s3_bucket_name,
+    'Key': s3_object_name, 
+    'Body': gcs_data
+  }
   if checksum: 
     crc_checksum = crc32c.crc32c(gcs_data) # returns an int
     crc_checksum_b64 = base64.b64encode(crc_checksum.to_bytes(4, byteorder='big', signed=False)).decode('ascii') # convert int to 32 bit and then base64 encode
     logging.info('GCS object CRC32C checksum: int(%s) and base64(%s)', crc_checksum, crc_checksum_b64)
-    s3_response = s3_client.put_object(Bucket=s3_bucket_name, Key=s3_object_name, Body=gcs_data, ChecksumAlgorithm='CRC32C', ChecksumCRC32C=crc_checksum_b64)
-    logging.info('Wrote GCS object to S3: %s', s3_response)
+    put_object_args.update({'ChecksumAlgorithm': 'CRC32C', 'ChecksumCRC32C' : crc_checksum_b64})
+
+  if isinstance(kms_key_arn, str) and kms_key_arn.startswith('arn:aws'): 
+    put_object_args.update({'ServerSideEncryption': 'aws:kms', 'SSEKMSKeyId': kms_key_arn})
+  else: 
+    put_object_args.update({'ServerSideEncryption': 'AES256'})
+
+  s3_response = s3_client.put_object(**put_object_args)
+  logging.info('Wrote GCS object to S3: %s', s3_response)
+
+  if checksum: 
     return {"ETag": s3_response["ETag"], "ChecksumCRC32C": crc_checksum_b64}
   else: 
-    s3_response = s3_client.put_object(Bucket=s3_bucket_name, Key=s3_object_name, Body=gcs_data)
-    logging.info('Wrote GCS object to S3: %s', s3_response)
     return {"ETag": s3_response["ETag"]}
 
 
 # copy a gcs object to s3 using mpu
-def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False) -> dict: 
+def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int, max_workers: int, checksum: bool = False, kms_key_arn: str = None) -> dict: 
   start_time = time.time() # capture start time
 
   # use naive object to get local time based on system timezone (use TZ environment variable to set timezone)
@@ -248,57 +333,15 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
     # initiate direct file copy
     total_parts = 1
     logging.info('Starting full object copy because GCS object size is either less than 5Mb or less than chunk-size')
-    _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum)
+    _copy_full(gcs_object, s3_bucket_name, s3_object_name, checksum, kms_key_arn)
   else: 
     # initiate multi-part copy
     total_parts = (gcs_object_size // chunk_size) + 1 
-    mpu_parts = [None] * total_parts
     logging.info('Starting multi-part object copy using %s parts, and checksum validation set to %s', total_parts, checksum)
-
-    if checksum: 
-      mpu = s3_client.create_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name, ChecksumAlgorithm='CRC32C')
-    else: 
-      mpu = s3_client.create_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name)
-
-    mpu_id = mpu['UploadId']
-
-    if (max_workers <= 1):
-      # perform a single threaded copy
-      logging.info('Using single threaded multi-part object copy because max-workers is less than or equal to 1')
-      for part_index in range(total_parts):
-        start_byte = part_index * chunk_size
-        end_byte = min((part_index + 1) * chunk_size, gcs_object_size) - 1 # end byte index is inclusive, so we minus 1
-        part_num = part_index + 1 # part numbers start at 1
-        copy_part_response = _copy_part(gcs_object, s3_bucket_name, s3_object_name, part_num, total_parts, mpu_id, start_byte, end_byte, checksum)
-        logging.info('copy_part response: %s', copy_part_response)
-        mpu_parts[part_index] = copy_part_response
-    else: 
-      # perform a multi-threaded copy
-      logging.info('Using multi-threaded multi-part object copy with max-workers equal to %s', max_workers)
-      futures = []
-      with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
-        for part_index in range(total_parts):
-          start_byte = part_index * chunk_size
-          end_byte = min((part_index + 1) * chunk_size, gcs_object_size) - 1 # end byte index is inclusive, so we minus 1
-          part_num = part_index + 1 # part numbers start at 1
-          futures.append(executor.submit(_copy_part, gcs_object, s3_bucket_name, s3_object_name, part_num, total_parts, mpu_id, start_byte, end_byte, checksum))
-        
-        for future in concurrent.futures.as_completed(futures):
-          try: 
-            copy_part_response = future.result()
-          except Exception as e:
-            logging.error('One of the multi-part object copy threads returned an exception [%s]. Aborting copy operation now!', e)
-            # cancel all pending tasks and bubble up the exception
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise e
-          mpu_parts[copy_part_response['PartNumber']-1] = copy_part_response
-          logging.info('copy_part response: %s', copy_part_response)
-
-    s3_response = s3_client.complete_multipart_upload(Bucket=s3_bucket_name, Key=s3_object_name, MultipartUpload={'Parts': mpu_parts}, UploadId=mpu_id)
-    logging.info('S3 complete_multipart_upload response: %s', s3_response)
+    _copy_mpu(gcs_object, s3_bucket_name, s3_object_name, gcs_object_size, total_parts, chunk_size, max_workers, checksum, kms_key_arn)
 
   # lets read some attributes of the final s3 target object
-  s3_object_attr = s3_client.get_object_attributes(Bucket=s3_bucket_name, Key=s3_object_name, ObjectAttributes=['ETag', 'Checksum', 'ObjectSize'])
+  s3_object_attr = s3_client.get_object_attributes(Bucket=s3_bucket_name, Key=s3_object_name, ObjectAttributes=['ETag', 'Checksum', 'ObjectSize', ''])
   s3_object_size = s3_object_attr.get('ObjectSize')
   logging.info('S3 target object attributes: %s', s3_object_attr)
 
@@ -337,6 +380,7 @@ def lambda_handler(event, context):
     default_chunk_size = event.get('defaults', {}).get('chunk_size', DEFAULT_CHUNK_SIZE)
     default_max_workers = event.get('defaults', {}).get('max_workers', DEFAULT_MAX_WORKERS)
     default_checksum = event.get('defaults', {}).get('checksum', DEFAULT_CHECKSUM_ENABLED)
+    default_kms_key_arn = event.get('defaults', {}).get('kms_key_arn')
 
     copy_count = 0
     copy_responses = []
@@ -347,10 +391,11 @@ def lambda_handler(event, context):
       chunk_size = int(object_def.get('chunk_size', default_chunk_size))
       max_workers = int(object_def.get('max_workers', default_max_workers))
       checksum = object_def.get('checksum', default_checksum) in [True, 'True', 'true', 'Yes', 'yes', 'Y', 'y', '1'] 
+      kms_key_arn = object_def.get('kms_key_arn', default_kms_key_arn)
 
       try: 
         logging.info('Copying object #%s: %s -> %s', copy_count, source_object_uri, target_object_uri)
-        copy_object_response = copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size, max_workers, checksum)
+        copy_object_response = copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size, max_workers, checksum, kms_key_arn)
         logging.info('Copying object #%s completed with response: %s', copy_count, copy_object_response)
       except Exception as e:
         logging.error('Error encountered copying object #%s: %s', copy_count, e)
