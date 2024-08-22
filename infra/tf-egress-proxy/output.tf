@@ -13,3 +13,7 @@ output "ssh_command" {
 output "proxy_test_command" {
   value                     = "curl --proxy http://${aws_lb.proxy_nlb.dns_name}:${var.proxy_port} ipinfo.io"
 }
+
+output "proxy_vpc_endpoint_service" {
+  value                     = aws_vpc_endpoint_service.proxy_nlb_vpces.service_name
+}
