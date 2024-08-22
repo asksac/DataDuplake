@@ -368,6 +368,8 @@ def copy_object_gcs_to_s3(source_object_uri, target_object_uri, chunk_size: int,
   )
   if checksum: 
     response['checksum_crc32c'] = s3_object_attr.get('Checksum', {}).get('ChecksumCRC32C')
+  if kms_key_arn: 
+    response['kms_key_arn'] = kms_key_arn
 
   return response
 
